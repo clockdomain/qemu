@@ -16,6 +16,7 @@
 #include "system/system.h"
 #include "hw/i2c/smbus_eeprom.h"
 #include "hw/i2c/i2c-test-master.h"
+#include "hw/misc/aspeed-qtest-ctrl.h"
 #include "hw/sensor/tmp105.h"
 #include "hw/sensor/isl_pmbus_vr.h"
 
@@ -107,12 +108,15 @@ static void ast1030_evb_i2c_init(AspeedMachineState *bmc)
                             0x48);
 
     /*
-     * qtest helper: synthetic I2C master pinned to bus 0 at 0x7E7C_0000.
-     * Inert unless driven via MMIO. Used by tests/qtest/aspeed_i2c-slave-test.c
-     * to exercise slave-mode DMA TX on the AST1030 I2C controller.
+     * qtest helpers. `i2c-test-master` at 0x7E7C_0000 is pinned to bus 0,
+     * used by aspeed_i2c-slave-test.c for slave-mode DMA TX coverage.
+     * `aspeed-qtest-ctrl` at 0x7E7D_0000 is a passive scratchpad used by
+     * the i2c_server qtest (currently only targets ast1060-evb, but we
+     * instantiate the control region here too for parity).
      */
     i2c_test_master_create(0x7E7C0000,
                            aspeed_i2c_get_bus(&soc->i2c, 0));
+    aspeed_qtest_ctrl_create(0x7E7D0000);
 }
 
 static void ast1060_evb_i2c_init(AspeedMachineState *bmc)
@@ -148,6 +152,17 @@ static void ast1060_evb_i2c_init(AspeedMachineState *bmc)
 
     uint8_t *eeprom1_buf = g_malloc0(32 * 1024);
     smbus_eeprom_init_one(aspeed_i2c_get_bus(&soc->i2c, 5), 0x51, eeprom1_buf);
+
+    /*
+     * qtest helpers for the i2c_server qtest suite. `i2c-test-master` is
+     * pinned to bus 3 so tests can drive transactions into the Aspeed
+     * controller configured as a slave there. `aspeed-qtest-ctrl` is a
+     * passive scratchpad used by firmware + qtest to coordinate scenario
+     * dispatch.
+     */
+    i2c_test_master_create(0x7E7C0000,
+                           aspeed_i2c_get_bus(&soc->i2c, 3));
+    aspeed_qtest_ctrl_create(0x7E7D0000);
 }
 
 static void aspeed_minibmc_machine_ast1030_evb_class_init(ObjectClass *oc,

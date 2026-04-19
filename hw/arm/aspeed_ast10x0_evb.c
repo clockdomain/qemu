@@ -15,6 +15,7 @@
 #include "hw/core/qdev-clock.h"
 #include "system/system.h"
 #include "hw/i2c/smbus_eeprom.h"
+#include "hw/i2c/i2c-test-master.h"
 #include "hw/sensor/tmp105.h"
 #include "hw/sensor/isl_pmbus_vr.h"
 
@@ -104,6 +105,14 @@ static void ast1030_evb_i2c_init(AspeedMachineState *bmc)
     /* Bus 5: optional secondary temperature sensor */
     i2c_slave_create_simple(aspeed_i2c_get_bus(&soc->i2c, 5), TYPE_TMP105,
                             0x48);
+
+    /*
+     * qtest helper: synthetic I2C master pinned to bus 0 at 0x7E7C_0000.
+     * Inert unless driven via MMIO. Used by tests/qtest/aspeed_i2c-slave-test.c
+     * to exercise slave-mode DMA TX on the AST1030 I2C controller.
+     */
+    i2c_test_master_create(0x7E7C0000,
+                           aspeed_i2c_get_bus(&soc->i2c, 0));
 }
 
 static void ast1060_evb_i2c_init(AspeedMachineState *bmc)

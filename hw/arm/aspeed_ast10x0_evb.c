@@ -162,6 +162,14 @@ static void ast1060_evb_i2c_init(AspeedMachineState *bmc)
      */
     i2c_test_master_create(0x7E7C0000,
                            aspeed_i2c_get_bus(&soc->i2c, 3));
+    /*
+     * Second i2c-test-master on bus 2. Used by the openprot i2c-qtest
+     * harness scenario 12 to exercise the IRQ-driven slave-notification
+     * path while keeping the bus-3 master untouched so the existing
+     * probe_ack / probe_nack tests still pass.
+     */
+    i2c_test_master_create(0x7E7C1000,
+                           aspeed_i2c_get_bus(&soc->i2c, 2));
     aspeed_qtest_ctrl_create(0x7E7D0000);
 }
 

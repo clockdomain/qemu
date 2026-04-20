@@ -20,8 +20,9 @@
 #include "hw/misc/aspeed-qtest-ctrl.h"
 
 /* Sysbus base addresses wired into hw/arm/aspeed_ast10x0_evb.c */
-#define TEST_MASTER_BASE 0x7E7C0000
-#define QTEST_CTRL_BASE  0x7E7D0000
+#define TEST_MASTER_BASE      0x7E7C0000  /* bus 3 - default stim path */
+#define TEST_MASTER_BUS2_BASE 0x7E7C1000  /* bus 2 - scenario 12 IRQ path */
+#define QTEST_CTRL_BASE       0x7E7D0000
 
 /* Known slaves on ast1060-evb after the AST10x0 I²C patch series */
 #define BUS3_PCA9554_ADDR 0x20
@@ -183,13 +184,23 @@ static QTestState *qtest_init_with_firmware(void)
      * which freezes the vCPU. With TCG enabled the guest runs instructions
      * normally; qtest still mediates MMIO reads/writes against the
      * scratchpad and the i2c-test-master.
+     *
+     * Set QTEST_TRACE_LOG=/path/to/file in the env to capture
+     * aspeed_i2c_* trace events — useful when debugging slave-side
+     * hangs or IRQ delivery (P4 in plan-i2c-qtest-irq-scenario.md).
      */
+    const char *trace_log = g_getenv("QTEST_TRACE_LOG");
+    char *trace_args = trace_log && trace_log[0]
+        ? g_strdup_printf("-d trace:aspeed_i2c_\\* -D %s ", trace_log)
+        : g_strdup("");
     char *cmdline = g_strdup_printf(
         "-accel tcg "
         "-M ast1060-evb -cpu cortex-m4 -nographic "
         "-semihosting-config enable=on,target=native "
+        "%s"
         "-kernel %s",
-        firmware);
+        trace_args, firmware);
+    g_free(trace_args);
     QTestState *s = qtest_init(cmdline);
     g_free(cmdline);
     return s;
@@ -277,25 +288,34 @@ static uint32_t read_result(QTestState *s, uint8_t *buf, size_t cap)
     return len;
 }
 
-/* i2c-test-master helpers */
-static void drive_master_write(QTestState *s, uint8_t addr,
-                               const uint8_t *data, uint32_t len)
+/* i2c-test-master helpers, parameterised over base so scenarios can
+ * pick which test-master (bus 3 = TEST_MASTER_BASE, bus 2 =
+ * TEST_MASTER_BUS2_BASE) to drive. */
+static void drive_master_write_at(QTestState *s, uint32_t base,
+                                  uint8_t addr, const uint8_t *data,
+                                  uint32_t len)
 {
     for (uint32_t i = 0; i < len; i++) {
-        qtest_writeb(s, TEST_MASTER_BASE + I2C_TEST_MASTER_R_BUF + i, data[i]);
+        qtest_writeb(s, base + I2C_TEST_MASTER_R_BUF + i, data[i]);
     }
-    qtest_writel(s, TEST_MASTER_BASE + I2C_TEST_MASTER_R_ADDR, addr);
-    qtest_writel(s, TEST_MASTER_BASE + I2C_TEST_MASTER_R_LEN,  len);
-    qtest_writel(s, TEST_MASTER_BASE + I2C_TEST_MASTER_R_CMD,
+    qtest_writel(s, base + I2C_TEST_MASTER_R_ADDR, addr);
+    qtest_writel(s, base + I2C_TEST_MASTER_R_LEN,  len);
+    qtest_writel(s, base + I2C_TEST_MASTER_R_CMD,
                  I2C_TEST_MASTER_CMD_WRITE);
+}
+
+static void drive_master_read_at(QTestState *s, uint32_t base,
+                                 uint8_t addr, uint32_t len)
+{
+    qtest_writel(s, base + I2C_TEST_MASTER_R_ADDR, addr);
+    qtest_writel(s, base + I2C_TEST_MASTER_R_LEN,  len);
+    qtest_writel(s, base + I2C_TEST_MASTER_R_CMD,
+                 I2C_TEST_MASTER_CMD_READ);
 }
 
 static void drive_master_read(QTestState *s, uint8_t addr, uint32_t len)
 {
-    qtest_writel(s, TEST_MASTER_BASE + I2C_TEST_MASTER_R_ADDR, addr);
-    qtest_writel(s, TEST_MASTER_BASE + I2C_TEST_MASTER_R_LEN,  len);
-    qtest_writel(s, TEST_MASTER_BASE + I2C_TEST_MASTER_R_CMD,
-                 I2C_TEST_MASTER_CMD_READ);
+    drive_master_read_at(s, TEST_MASTER_BUS2_BASE, addr, len);
 }
 
 /* ---------- scenario 1: configure_slave address validation ---------- */
@@ -401,7 +421,9 @@ static void test_scenario_09(void)
         check_pass(s);  /* always aborts with the firmware's tag */
     }
 
-    drive_master_write(s, BUS3_SLAVE_ADDR, pattern, sizeof(pattern));
+    /* Firmware slave is configured on bus 2; use the bus-2 test-master. */
+    drive_master_write_at(s, TEST_MASTER_BUS2_BASE, BUS3_SLAVE_ADDR,
+                          pattern, sizeof(pattern));
 
     wait_scenario_done(s);
     check_pass(s);
@@ -437,6 +459,42 @@ static void test_scenario_10(void)
     uint32_t len = read_result(s, got, sizeof(got));
     g_assert_cmpuint(len, ==, 1);
     g_assert_cmpuint(got[0], ==, 8);  /* firmware reports TX length */
+
+    qtest_quit(s);
+}
+
+/* ---------- scenario 12: slave RX via IRQ-driven notification ---------- */
+static void test_scenario_12(void)
+{
+    static const uint8_t pattern[] = { 0x5A, 0xA5, 0xC3, 0x3C, 0xF0, 0x0F };
+    static const uint8_t slave_addr = 0x57;
+    QTestState *s = qtest_init_with_firmware();
+    if (!s) return;
+
+    dispatch_scenario(s, 12);
+    /* Wait for firmware to configure + register_notification + arm. */
+    g_assert_true(poll_status_oneof(s, STATUS_ARMED,
+                                    ASPEED_QTEST_CTRL_STATUS_FAIL));
+    uint32_t st = qtest_readl(s, QTEST_CTRL_BASE + ASPEED_QTEST_CTRL_R_STATUS);
+    if (st == ASPEED_QTEST_CTRL_STATUS_FAIL) {
+        check_pass(s);
+    }
+
+    /*
+     * Use the bus-2 i2c-test-master (mounted alongside the bus-3 one in
+     * hw/arm/aspeed_ast10x0_evb.c). Master-write to the firmware's
+     * configured slave address on the same bus the i2c_server owns.
+     */
+    drive_master_write_at(s, TEST_MASTER_BUS2_BASE, slave_addr,
+                          pattern, sizeof(pattern));
+
+    wait_scenario_done(s);
+    check_pass(s);
+
+    uint8_t got[sizeof(pattern)] = {0};
+    uint32_t len = read_result(s, got, sizeof(got));
+    g_assert_cmpuint(len, ==, sizeof(pattern));
+    g_assert_cmpmem(got, len, pattern, sizeof(pattern));
 
     qtest_quit(s);
 }
@@ -483,6 +541,7 @@ int main(int argc, char **argv)
     qtest_add_func("/ast1060/i2c_server/scenario_09", test_scenario_09);
     qtest_add_func("/ast1060/i2c_server/scenario_10", test_scenario_10);
     qtest_add_func("/ast1060/i2c_server/scenario_11", test_scenario_11);
+    qtest_add_func("/ast1060/i2c_server/scenario_12", test_scenario_12);
 
     return g_test_run();
 }

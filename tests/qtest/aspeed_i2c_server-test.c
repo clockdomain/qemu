@@ -191,7 +191,8 @@ static QTestState *qtest_init_with_firmware(void)
      */
     const char *trace_log = g_getenv("QTEST_TRACE_LOG");
     char *trace_args = trace_log && trace_log[0]
-        ? g_strdup_printf("-d trace:aspeed_i2c_\\* -D %s ", trace_log)
+        ? g_strdup_printf("-d trace:aspeed_i2c_\\*,trace:i2c_*,trace:nvic_*,int,guest_errors,unimp -D %s ",
+                          trace_log)
         : g_strdup("");
     char *cmdline = g_strdup_printf(
         "-accel tcg "
@@ -254,7 +255,17 @@ static void dispatch_scenario(QTestState *s, uint32_t id)
 
 static void wait_scenario_done(QTestState *s)
 {
-    g_assert_true(poll_with_timeout(s, ASPEED_QTEST_CTRL_R_SCENARIO_ID, 0));
+    if (!poll_with_timeout(s, ASPEED_QTEST_CTRL_R_SCENARIO_ID, 0)) {
+        uint32_t status = qtest_readl(s,
+            QTEST_CTRL_BASE + ASPEED_QTEST_CTRL_R_STATUS);
+        uint32_t sid = qtest_readl(s,
+            QTEST_CTRL_BASE + ASPEED_QTEST_CTRL_R_SCENARIO_ID);
+        uint32_t len = qtest_readl(s,
+            QTEST_CTRL_BASE + ASPEED_QTEST_CTRL_R_RESULT_LEN);
+        g_test_message("wait_scenario_done timeout: status=%u sid=%u len=%u",
+                       status, sid, len);
+        g_assert_not_reached();
+    }
 }
 
 static void check_pass(QTestState *s)
@@ -316,6 +327,75 @@ static void drive_master_read_at(QTestState *s, uint32_t base,
 static void drive_master_read(QTestState *s, uint8_t addr, uint32_t len)
 {
     drive_master_read_at(s, TEST_MASTER_BUS2_BASE, addr, len);
+}
+
+/*
+ * ---------------------------------------------------------------------------
+ * NVIC IRQ-line probe (synthetic injection)
+ * ---------------------------------------------------------------------------
+ *
+ * Isolates the Cortex-M NVIC from the aspeed_i2c controller model: once the
+ * firmware has booted and i2c_server has registered its interrupt object
+ * (enabling NVIC line 112), force-raise the line directly via
+ * qtest_set_irq_in and observe the intercepted level via qtest_get_irq.
+ *
+ * Serves as the ground-truth baseline before debugging the full
+ * aspeed_i2c -> NVIC -> kernel -> wait_group -> USER-signal path.
+ */
+static void test_nvic_irq112_probe(void)
+{
+    QTestState *s = qtest_init_with_firmware();
+    if (!s) return;
+
+    /* Wait for firmware ready — i2c_server has realised its interrupt object
+     * and the NVIC has enabled line 112 by this point. */
+    g_assert_true(poll_with_timeout(s, ASPEED_QTEST_CTRL_R_READY, 1));
+
+    qtest_irq_intercept_in(s, "/machine/soc/armv7m");
+
+    /* Baseline: line should be low. */
+    g_assert_false(qtest_get_irq(s, 112));
+
+    /* Force-raise IRQ 112 into the NVIC (anonymous input gpio indexed by
+     * IRQ number). */
+    qtest_set_irq_in(s, "/machine/soc/armv7m", NULL, 112, 1);
+    g_assert_true(qtest_get_irq(s, 112));
+
+    /* Drop the line again. */
+    qtest_set_irq_in(s, "/machine/soc/armv7m", NULL, 112, 0);
+    g_assert_false(qtest_get_irq(s, 112));
+
+    qtest_quit(s);
+}
+
+/*
+ * Companion to test_nvic_irq112_probe that does NOT install a qtest
+ * intercept on the NVIC input lines. With no interceptor, the NVIC's
+ * native handler latches the pending bit, and — provided the firmware
+ * has enabled line 112 — the Cortex-M should vector into the exception.
+ *
+ * The delivery itself is observed out-of-band: set QTEST_TRACE_LOG to a
+ * file path and grep for "Taking exception 128" (Cortex-M exception
+ * number = 16 + IRQ 112). This test drives the line high; the caller
+ * verifies the log separately.
+ */
+static void test_nvic_irq112_delivery(void)
+{
+    QTestState *s = qtest_init_with_firmware();
+    if (!s) return;
+
+    g_assert_true(poll_with_timeout(s, ASPEED_QTEST_CTRL_R_READY, 1));
+
+    /* No intercept — we want the NVIC's native path to see this. */
+    qtest_set_irq_in(s, "/machine/soc/armv7m", NULL, 112, 1);
+
+    /* Let the vCPU run long enough to service the exception. With
+     * -accel tcg the guest runs during sleeps. */
+    g_usleep(50 * 1000);
+
+    qtest_set_irq_in(s, "/machine/soc/armv7m", NULL, 112, 0);
+
+    qtest_quit(s);
 }
 
 /* ---------- scenario 1: configure_slave address validation ---------- */
@@ -532,6 +612,9 @@ int main(int argc, char **argv)
     qtest_add_func("/ast1060/qtest_ctrl/reset_clears",  test_ctrl_reset_clears);
     qtest_add_func("/ast1060/test_master/probe_ack",    test_probe_ack);
     qtest_add_func("/ast1060/test_master/probe_nack",   test_probe_nack);
+
+    qtest_add_func("/ast1060/nvic/irq112_probe",    test_nvic_irq112_probe);
+    qtest_add_func("/ast1060/nvic/irq112_delivery", test_nvic_irq112_delivery);
 
     qtest_add_func("/ast1060/i2c_server/scenario_01", test_scenario_01);
     qtest_add_func("/ast1060/i2c_server/scenario_05", test_scenario_05);

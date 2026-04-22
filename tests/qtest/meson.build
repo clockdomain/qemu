@@ -217,6 +217,7 @@ qtests_aspeed = \
    'aspeed_hace-test',
    'aspeed_i2c-slave-test',
    'aspeed_i2c_server-test',
+   'aspeed_mctp_smoke-test',
    'aspeed_scu-test',
    'aspeed_smc-test']
 qtests_aspeed64 = \

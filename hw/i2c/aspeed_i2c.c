@@ -86,6 +86,8 @@ static inline void aspeed_i2c_bus_raise_slave_interrupt(AspeedI2CBus *bus)
         return;
     }
 
+    trace_aspeed_i2c_bus_raise_interrupt(bus->regs[R_I2CS_INTR_STS],
+                                         "slave-irq");
     bus->controller->intr_status |= 1 << bus->id;
     qemu_irq_raise(aic->bus_get_irq(bus));
 }
@@ -814,7 +816,16 @@ static void aspeed_i2c_bus_new_write(AspeedI2CBus *bus, hwaddr offset,
         } else {
             bus->regs[R_I2CS_CMD] = value;
         }
-        i2c_slave_set_address(bus->slave, bus->regs[R_I2CS_DEV_ADDR]);
+        /*
+         * I2CS_DEV_ADDR carries the 7-bit address in SLAVE_DEV_ADDR1 plus
+         * enable/status flag bits (bit 7 is the "use DEV_ADDR1" enable in
+         * new-mode). Pass only the address field to i2c_slave_set_address
+         * so the bus slave-match check in i2c_scan_bus compares against
+         * the true 7-bit value.
+         */
+        i2c_slave_set_address(bus->slave,
+            SHARED_ARRAY_FIELD_EX32(bus->regs, R_I2CS_DEV_ADDR,
+                                    SLAVE_DEV_ADDR1));
         break;
     case A_I2CS_INTR_CTRL:
         bus->regs[R_I2CS_INTR_CTRL] = value;
@@ -1406,6 +1417,15 @@ static const TypeInfo aspeed_i2c_info = {
     .abstract   = true,
 };
 
+/*
+ * WAIT_TX_DMA / WAIT_RX_DMA status bits used by real AST HW in
+ * slave-interrupt status encodings. Not yet declared as register fields
+ * in aspeed_i2c.h; defined here because the DDK's handle_slave_interrupt
+ * pattern-matches on the raw bit values regardless of buffer vs DMA mode.
+ */
+#define ASPEED_I2CS_INTR_STS_WAIT_RX_DMA    BIT(24)
+#define ASPEED_I2CS_INTR_STS_WAIT_TX_DMA    BIT(25)
+
 static int aspeed_i2c_bus_new_slave_event(AspeedI2CBus *bus,
                                           enum i2c_event event)
 {
@@ -1424,30 +1444,67 @@ static int aspeed_i2c_bus_new_slave_event(AspeedI2CBus *bus,
             ARRAY_FIELD_EX32(bus->regs, I2CS_DMA_LEN, RX_BUF_LEN) + 1;
         i2c_ack(bus->bus);
         break;
-    case I2C_START_RECV:
+    case I2C_START_SEND:
         /*
-         * External master is about to read from us (slave TX). Only DMA
-         * slave TX is modelled; firmware that tries to drive slave TX via
-         * the pool buffer or byte buffer will still see this path.
+         * Synchronous slave write from an external master (e.g. the qtest
+         * i2c-test-master). Buffer mode + packet mode is the only
+         * supported sync path: reset the pool RX count so subsequent
+         * aspeed_i2c_bus_slave_send calls can stream bytes into
+         * bus->pool, and let the address-match + STOP encoding be
+         * delivered on I2C_FINISH.
          */
-        if (!SHARED_ARRAY_FIELD_EX32(bus->regs, R_I2CS_CMD, TX_DMA_EN)) {
+        if (!SHARED_ARRAY_FIELD_EX32(bus->regs, R_I2CS_CMD, RX_BUFF_EN)) {
             qemu_log_mask(LOG_GUEST_ERROR,
-                          "%s: Slave mode TX DMA is not enabled\n", __func__);
+                          "%s: Slave sync send without RX_BUFF_EN\n",
+                          __func__);
             return -1;
         }
-        ARRAY_FIELD_DP32(bus->regs, I2CS_DMA_LEN_STS, TX_LEN, 0);
-        aspeed_i2c_set_slave_tx_dma_dram_offset(bus);
-        bus->regs[R_I2CC_DMA_LEN] =
-            ARRAY_FIELD_EX32(bus->regs, I2CS_DMA_LEN, TX_BUF_LEN) + 1;
+        SHARED_ARRAY_FIELD_DP32(bus->regs, R_I2CC_POOL_CTRL, RX_COUNT, 0);
         break;
+    case I2C_START_RECV:
+        if (SHARED_ARRAY_FIELD_EX32(bus->regs, R_I2CS_CMD, TX_DMA_EN)) {
+            ARRAY_FIELD_DP32(bus->regs, I2CS_DMA_LEN_STS, TX_LEN, 0);
+            aspeed_i2c_set_slave_tx_dma_dram_offset(bus);
+            bus->regs[R_I2CC_DMA_LEN] =
+                ARRAY_FIELD_EX32(bus->regs, I2CS_DMA_LEN, TX_BUF_LEN) + 1;
+            break;
+        }
+        if (SHARED_ARRAY_FIELD_EX32(bus->regs, R_I2CS_CMD, TX_BUFF_EN)) {
+            /*
+             * Buffer-mode slave TX — firmware pre-loaded bus->pool via
+             * the i2cbuff MMIO region and armed with TX_BUFF_EN. Reset
+             * TX_LEN so aspeed_i2c_bus_slave_recv walks the pool from
+             * byte 0.
+             */
+            ARRAY_FIELD_DP32(bus->regs, I2CS_DMA_LEN_STS, TX_LEN, 0);
+            break;
+        }
+        qemu_log_mask(LOG_GUEST_ERROR,
+                      "%s: Slave mode TX: no TX_DMA_EN/TX_BUFF_EN\n",
+                      __func__);
+        return -1;
     case I2C_FINISH:
         ARRAY_FIELD_DP32(bus->regs, I2CS_INTR_STS, PKT_CMD_DONE, 1);
         ARRAY_FIELD_DP32(bus->regs, I2CS_INTR_STS, SLAVE_ADDR_RX_MATCH, 1);
-        SHARED_ARRAY_FIELD_DP32(bus->regs, R_I2CS_INTR_STS, NORMAL_STOP, 1);
         if (SHARED_ARRAY_FIELD_EX32(bus->regs, R_I2CS_CMD, TX_DMA_EN)) {
+            /* Slave DMA TX: existing encoding. */
+            SHARED_ARRAY_FIELD_DP32(bus->regs, R_I2CS_INTR_STS, NORMAL_STOP, 1);
             SHARED_ARRAY_FIELD_DP32(bus->regs, R_I2CS_INTR_STS, TX_ACK, 1);
             SHARED_ARRAY_FIELD_DP32(bus->regs, R_I2CS_CMD, TX_DMA_EN, 0);
+        } else if (SHARED_ARRAY_FIELD_EX32(bus->regs, R_I2CS_CMD, TX_BUFF_EN)) {
+            /*
+             * Slave buffer TX — DDK handle_slave_interrupt expects
+             * SLAVE_MATCH | WAIT_TX_DMA as the "DataSent" encoding (the
+             * WAIT_TX_DMA mnemonic is shared across DMA/buffer modes on
+             * real hardware).  Do not set NORMAL_STOP here: STOP in
+             * combination with WAIT_TX_DMA is not a recognised sts
+             * pattern in the DDK, so the poll would miss DataSent.
+             */
+            bus->regs[R_I2CS_INTR_STS] |= ASPEED_I2CS_INTR_STS_WAIT_TX_DMA;
+            SHARED_ARRAY_FIELD_DP32(bus->regs, R_I2CS_CMD, TX_BUFF_EN, 0);
         } else {
+            /* Slave RX (buffer or DMA): report stop + RX_DONE. */
+            SHARED_ARRAY_FIELD_DP32(bus->regs, R_I2CS_INTR_STS, NORMAL_STOP, 1);
             SHARED_ARRAY_FIELD_DP32(bus->regs, R_I2CS_INTR_STS, RX_DONE, 1);
         }
         aspeed_i2c_bus_raise_slave_interrupt(bus);
@@ -1533,11 +1590,62 @@ static void aspeed_i2c_bus_slave_send_async(I2CSlave *slave, uint8_t data)
     aspeed_i2c_bus_raise_interrupt(bus);
 }
 
+/*
+ * Synchronous slave send — an external master is writing a byte to us.
+ * In new-mode buffer-packet slave, we accumulate the byte into the
+ * bus pool and track the running count via I2CC_POOL_CTRL.RX_COUNT so
+ * the DDK's handle_slave_interrupt can read it back via i2cc0c after
+ * the subsequent I2C_FINISH.
+ */
+static int aspeed_i2c_bus_slave_send(I2CSlave *slave, uint8_t data)
+{
+    BusState *qbus = qdev_get_parent_bus(DEVICE(slave));
+    AspeedI2CBus *bus = ASPEED_I2C_BUS(qbus->parent);
+
+    if (!aspeed_i2c_is_new_mode(bus->controller) ||
+        !SHARED_ARRAY_FIELD_EX32(bus->regs, R_I2CS_CMD, RX_BUFF_EN)) {
+        qemu_log_mask(LOG_UNIMP,
+                      "%s: Sync slave send without new-mode RX_BUFF_EN\n",
+                      __func__);
+        return -1;
+    }
+
+    uint32_t idx = SHARED_ARRAY_FIELD_EX32(bus->regs, R_I2CC_POOL_CTRL,
+                                           RX_COUNT);
+    if (idx >= ASPEED_I2C_BUS_POOL_SIZE) {
+        qemu_log_mask(LOG_GUEST_ERROR,
+                      "%s: slave pool overflow on bus %d\n",
+                      __func__, bus->id);
+        return -1;
+    }
+    bus->pool[idx] = data;
+    SHARED_ARRAY_FIELD_DP32(bus->regs, R_I2CC_POOL_CTRL, RX_COUNT, idx + 1);
+    return 0;
+}
+
 static uint8_t aspeed_i2c_bus_new_slave_recv(AspeedI2CBus *bus)
 {
     AspeedI2CState *s = bus->controller;
     MemTxResult result;
     uint8_t data = 0xff;
+
+    /*
+     * Buffer-mode slave TX: firmware pre-loaded bus->pool via the
+     * i2cbuff MMIO region (and set i2cc0c.TxDataByteCount). Walk the
+     * pool byte-by-byte; if the master reads past the preloaded length
+     * we return the idle bus value (0xff) rather than a DMA error.
+     */
+    if (SHARED_ARRAY_FIELD_EX32(bus->regs, R_I2CS_CMD, TX_BUFF_EN)) {
+        uint32_t tx_len_valid =
+            SHARED_ARRAY_FIELD_EX32(bus->regs, R_I2CC_POOL_CTRL, TX_COUNT) + 1;
+        uint32_t idx = ARRAY_FIELD_EX32(bus->regs, I2CS_DMA_LEN_STS, TX_LEN);
+        if (idx < tx_len_valid && idx < ASPEED_I2C_BUS_POOL_SIZE) {
+            data = bus->pool[idx];
+        }
+        ARRAY_FIELD_DP32(bus->regs, I2CS_DMA_LEN_STS, TX_LEN, idx + 1);
+        trace_aspeed_i2c_bus_send("SLAVE_BUF", idx + 1, tx_len_valid, data);
+        return data;
+    }
 
     if (!bus->regs[R_I2CC_DMA_LEN]) {
         qemu_log_mask(LOG_GUEST_ERROR,
@@ -1593,6 +1701,7 @@ static void aspeed_i2c_bus_slave_class_init(ObjectClass *klass,
     dc->desc = "Aspeed I2C Bus Slave";
 
     sc->event = aspeed_i2c_bus_slave_event;
+    sc->send = aspeed_i2c_bus_slave_send;
     sc->send_async = aspeed_i2c_bus_slave_send_async;
     sc->recv = aspeed_i2c_bus_slave_recv;
 }

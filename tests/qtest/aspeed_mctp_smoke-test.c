@@ -42,6 +42,30 @@
 /* Bus-2 i2c-test-master sysbus base, mounted by hw/arm/aspeed_ast10x0_evb.c. */
 #define TEST_MASTER_BUS2_BASE  0x7E7C1000
 
+/*
+ * aspeed-qtest-ctrl scratchpad MMIO. The mctp_server, when built with the
+ * services/mctp/server `qtest` Cargo feature, snapshots its polling-loop
+ * counters into the R_RESULT region every 256 loop iterations.
+ *
+ * Slot layout (each slot is a u32 written byte-by-byte, since the device
+ * truncates multi-byte writes to R_RESULT to a single byte):
+ *   slot 0 (0x10): i2c_pkt      -- frames decoded + accepted by router
+ *   slot 1 (0x14): idle_polls   -- wait_for_messages timeouts
+ *   slot 2 (0x18): decode_err   -- MctpI2cReceiver::decode failures
+ *   slot 3 (0x1c): inbound_err  -- Server::inbound() rejections
+ *   slot 4 (0x20): spdm_ok      -- responder_process_message Ok
+ *   slot 5 (0x24): spdm_err     -- responder_process_message Err (high in idle)
+ */
+#define QTEST_CTRL_BASE        0x7E7D0000
+#define QTEST_CTRL_R_READY     0x04
+#define QTEST_CTRL_R_RESULT    0x10
+#define COUNTER_I2C_PKT        0
+#define COUNTER_IDLE_POLLS     1
+#define COUNTER_DECODE_ERR     2
+#define COUNTER_INBOUND_ERR    3
+#define COUNTER_SPDM_OK        4
+#define COUNTER_SPDM_ERR       5
+
 /* Firmware-side constants — must match services/mctp/server/src/main.rs. */
 #define FW_OWN_I2C_ADDR        0x10  /* OWN_I2C_ADDR */
 #define FW_OWN_EID             0x08  /* OWN_EID */
@@ -101,6 +125,21 @@ static QTestState *qtest_init_with_firmware(void)
     QTestState *s = qtest_init(cmdline);
     g_free(cmdline);
     return s;
+}
+
+/*
+ * Read a u32 counter from the scratchpad's R_RESULT slot. The mctp_server
+ * (with the `qtest` Cargo feature on) writes each counter byte-by-byte
+ * into 4-byte slots starting at R_RESULT.
+ */
+static uint32_t read_counter(QTestState *s, unsigned slot)
+{
+    uint32_t v = 0;
+    for (unsigned i = 0; i < 4; i++) {
+        v |= (uint32_t)qtest_readb(s,
+            QTEST_CTRL_BASE + QTEST_CTRL_R_RESULT + slot * 4 + i) << (i * 8);
+    }
+    return v;
 }
 
 /*
@@ -195,6 +234,25 @@ static void test_getversion_smoke(void)
     memcpy(&body[3], mctp_payload, MCTP_LEN);
     body[3 + MCTP_LEN] = pec;
 
+    /*
+     * Diagnostic: confirm the qtest-feature observer actually wired up.
+     * mctp_loop sets R_READY=1 immediately before entering the polling
+     * loop. If this fires, the qtest Cargo feature is active AND the
+     * scratchpad MMIO grant is honoured.
+     */
+    uint32_t ready = qtest_readl(s, QTEST_CTRL_BASE + QTEST_CTRL_R_READY);
+    g_test_message("R_READY before send = %u (1 = qtest_obs active)", ready);
+
+    /*
+     * Snapshot pre-send counters so we can attribute deltas to this
+     * specific GetVersion frame. spdm_err is expected to be high (the
+     * loop polls the responder on every iteration).
+     */
+    uint32_t pre_i2c_pkt     = read_counter(s, COUNTER_I2C_PKT);
+    uint32_t pre_decode_err  = read_counter(s, COUNTER_DECODE_ERR);
+    uint32_t pre_inbound_err = read_counter(s, COUNTER_INBOUND_ERR);
+    uint32_t pre_spdm_ok     = read_counter(s, COUNTER_SPDM_OK);
+
     drive_write(s, FW_OWN_I2C_ADDR, body, BODY_LEN);
 
     /*
@@ -205,6 +263,38 @@ static void test_getversion_smoke(void)
     uint32_t status = qtest_readl(s,
         TEST_MASTER_BUS2_BASE + I2C_TEST_MASTER_R_STATUS);
     g_assert_cmphex(status & I2C_TEST_MASTER_STATUS_NACK, ==, 0);
+
+    /*
+     * Give the firmware enough wallclock to:
+     *   slave_wait_event returns -> wait_for_messages returns Ok ->
+     *   MctpI2cReceiver::decode -> Server::inbound -> SPDM listener ->
+     *   responder_process_message -> outbound I2cSender -> next
+     *   snapshot tick (every 256 loop iterations).
+     *
+     * Each loop iteration includes a wait_for_messages call with a 10 000-
+     * slave-poll budget; under -accel tcg one full iteration can take
+     * tens of ms of host time, so 256 iterations need a few seconds.
+     */
+    g_usleep(5000000);
+
+    uint32_t post_i2c_pkt     = read_counter(s, COUNTER_I2C_PKT);
+    uint32_t post_decode_err  = read_counter(s, COUNTER_DECODE_ERR);
+    uint32_t post_inbound_err = read_counter(s, COUNTER_INBOUND_ERR);
+    uint32_t post_spdm_ok     = read_counter(s, COUNTER_SPDM_OK);
+
+    g_test_message(
+        "counters delta:  i2c_pkt %u->%u  decode_err %u->%u  "
+        "inbound_err %u->%u  spdm_ok %u->%u",
+        pre_i2c_pkt, post_i2c_pkt,
+        pre_decode_err, post_decode_err,
+        pre_inbound_err, post_inbound_err,
+        pre_spdm_ok, post_spdm_ok);
+
+    /* Layered diagnosis -- each assertion isolates one stage. */
+    g_assert_cmpuint(post_decode_err - pre_decode_err, ==, 0);
+    g_assert_cmpuint(post_i2c_pkt - pre_i2c_pkt, >=, 1);
+    g_assert_cmpuint(post_inbound_err - pre_inbound_err, ==, 0);
+    g_assert_cmpuint(post_spdm_ok - pre_spdm_ok, >=, 1);
 
     qtest_quit(s);
 }

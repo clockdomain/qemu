@@ -1460,6 +1460,17 @@ static int aspeed_i2c_bus_new_slave_event(AspeedI2CBus *bus,
             return -1;
         }
         SHARED_ARRAY_FIELD_DP32(bus->regs, R_I2CC_POOL_CTRL, RX_COUNT, 0);
+        /*
+         * Honour I2CC_FUN_CTRL.S_SAVE_ADDR (bit 20): when set, real AST
+         * hardware prepends the on-bus address byte (slave_addr << 1) at
+         * pool[0] before any data bytes. MCTP-over-SMBus per DSP0237
+         * requires this byte at data[0] for MctpI2cEncap::decode to
+         * validate the frame layout.
+         */
+        if (ARRAY_FIELD_EX32(bus->regs, I2CC_FUN_CTRL, S_SAVE_ADDR)) {
+            bus->pool[0] = (uint8_t)(bus->slave->address << 1);
+            SHARED_ARRAY_FIELD_DP32(bus->regs, R_I2CC_POOL_CTRL, RX_COUNT, 1);
+        }
         break;
     case I2C_START_RECV:
         if (SHARED_ARRAY_FIELD_EX32(bus->regs, R_I2CS_CMD, TX_DMA_EN)) {

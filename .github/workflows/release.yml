@@ -1,0 +1,102 @@
+# SPDX-License-Identifier: GPL-2.0-or-later
+#
+# Build and publish ast10x0-i2c QEMU release tarballs.
+#
+# Triggers:
+#   - Tag push matching ast10x0-i2c-*: builds the matrix, attaches tarballs
+#     and sha256 files to a GitHub Release named after the tag.
+#   - Manual dispatch: same matrix; uploads as workflow artifacts only
+#     (does not publish a release). Useful for dry runs before tagging.
+
+name: release
+
+on:
+  push:
+    tags:
+      - 'ast10x0-i2c-*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag to record in the artifact (e.g. ast10x0-i2c-2026.04). Does not actually create a release.'
+        required: true
+
+permissions:
+  contents: write   # needed for softprops/action-gh-release on tag push.
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-22.04
+            triple: linux-x86_64
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          # Need full history so SOURCE_DATE_EPOCH from `git log -1` is stable.
+          fetch-depth: 0
+
+      - name: Install build deps (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+              ninja-build \
+              meson \
+              python3 \
+              python3-venv \
+              pkg-config \
+              patchelf \
+              xz-utils \
+              libglib2.0-dev \
+              libpixman-1-dev \
+              libslirp-dev \
+              libcap-ng-dev \
+              libattr1-dev \
+              zlib1g-dev
+
+      - name: Build release tarball
+        env:
+          BUILD_TRIPLE: ${{ matrix.triple }}
+          RELEASE_TAG: ${{ github.event.inputs.tag || github.ref_name }}
+        run: ./scripts/build-release.sh
+
+      - name: Smoke test (extracted tarball)
+        env:
+          BUILD_TRIPLE: ${{ matrix.triple }}
+        run: |
+          set -e
+          NAME="qemu-system-arm-ast10x0-i2c"
+          tar -tJf "dist/${NAME}-${BUILD_TRIPLE}.tar.xz" | head -20
+          tar -xJf "dist/${NAME}-${BUILD_TRIPLE}.tar.xz" -C /tmp
+          /tmp/${NAME}-${BUILD_TRIPLE}/bin/qemu-system-arm --version
+          # The patched fork must register the AST1030/AST10x0 machine.
+          # If the regex below stops matching, either the patch was lost
+          # or the machine got renamed — either way, fail the release.
+          /tmp/${NAME}-${BUILD_TRIPLE}/bin/qemu-system-arm -machine help \
+              | tee /tmp/machines.txt
+          grep -Eiq 'ast103?0' /tmp/machines.txt
+
+      - name: Upload workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: qemu-${{ matrix.triple }}
+          path: |
+            dist/*.tar.xz
+            dist/*.sha256
+          retention-days: 14
+
+      - name: Publish release
+        if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/*.tar.xz
+            dist/*.sha256
+          fail_on_unmatched_files: true
+          generate_release_notes: true

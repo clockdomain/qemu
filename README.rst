@@ -2,6 +2,18 @@
 QEMU README
 ===========
 
+.. note::
+
+   This is a fork of upstream QEMU, branch ``ast10x0-i2c``, that adds
+   ASPEED AST10x0 / AST1030 I²C device emulation. It exists to back the
+   ``--config=virt_ast10x0_i2c`` validation lane in
+   `clockdomain/bundle <https://github.com/clockdomain/bundle>`_.
+
+   See `RELEASE.md <RELEASE.md>`_ for the binary release process. The
+   release workflow at ``.github/workflows/release.yml`` builds a
+   self-contained ``qemu-system-arm`` tarball on each tag matching
+   ``ast10x0-i2c-*`` and attaches it to a GitHub Release.
+
 QEMU is a generic and open source machine & userspace emulator and
 virtualizer.
 
